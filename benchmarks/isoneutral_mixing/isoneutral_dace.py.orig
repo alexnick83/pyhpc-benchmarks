@@ -1,0 +1,298 @@
+import numpy as np
+import dace as dc
+
+
+# Symbols
+S1 = dc.symbol('S1', dtype=dc.int32)  # math.ceil(2 * size ** (1/3))
+S2 = dc.symbol('S2', dtype=dc.int32)  # math.ceil(0.25 * size ** (1/3))
+
+
+@dc.program
+def get_drhodT(salt: dc.float64[S1, S1, S2],
+               temp: dc.float64[S1, S1, S2],
+               p: dc.float64[S2]):
+    rho0 = 1024.0
+    z0 = 0.0
+    theta0 = 283.0 - 273.15
+    grav = 9.81
+    betaT = 1.67e-4
+    betaTs = 1e-5
+    gammas = 1.1e-8
+
+    zz = -p - z0
+    thetas = temp - theta0
+    return -(betaTs * thetas + betaT * (1 - gammas * grav * zz * rho0)) * rho0
+
+
+@dc.program
+def get_drhodS(salt: dc.float64[S1, S1, S2],
+               temp: dc.float64[S1, S1, S2],
+               p: dc.float64[S2]):
+    betaS = 0.78e-3
+    rho0 = 1024.
+    return betaS * rho0 * np.ones_like(temp)
+
+
+@dc.program
+def isoneutral_diffusion_pre(maskT: dc.float64[S1, S1, S2],
+                             maskU: dc.float64[S1, S1, S2],
+                             maskV: dc.float64[S1, S1, S2],
+                             maskW: dc.float64[S1, S1, S2],
+                             dxt: dc.float64[S1],
+                             dxu: dc.float64[S1],
+                             dyt: dc.float64[S1],
+                             dyu: dc.float64[S1],
+                             dzt: dc.float64[S2],
+                             dzw: dc.float64[S2],
+                             cost: dc.float64[S1],
+                             cosu: dc.float64[S1],
+                             salt: dc.float64[S1, S1, S2, 3],
+                             temp: dc.float64[S1, S1, S2, 3],
+                             zt: dc.float64[S2],
+                             K_iso: dc.float64[S1, S1, S2],
+                             K_11: dc.float64[S1, S1, S2],
+                             K_22: dc.float64[S1, S1, S2],
+                             K_33: dc.float64[S1, S1, S2],
+                             Ai_ez: dc.float64[S1, S1, S2, 2, 2],
+                             Ai_nz: dc.float64[S1, S1, S2, 2, 2],
+                             Ai_bx: dc.float64[S1, S1, S2, 2, 2],
+                             Ai_by: dc.float64[S1, S1, S2, 2, 2]):
+    """
+    Isopycnal diffusion for tracer
+    following functional formulation by Griffies et al
+    Code adopted from MOM2.1
+    """
+    epsln = 1e-20
+    iso_slopec = 1e-3
+    iso_dslope = 1e-3
+    K_iso_steep = 50.
+    tau = 0
+
+    dTdx = np.zeros_like(K_11)
+    dSdx = np.zeros_like(K_11)
+    dTdy = np.zeros_like(K_11)
+    dSdy = np.zeros_like(K_11)
+    dTdz = np.zeros_like(K_11)
+    dSdz = np.zeros_like(K_11)
+
+    """
+    drho_dt and drho_ds at centers of T cells
+    """
+    drdT = maskT * get_drhodT(
+        salt[:, :, :, tau], temp[:, :, :, tau], np.abs(zt)
+    )
+    drdS = maskT * get_drhodS(
+        salt[:, :, :, tau], temp[:, :, :, tau], np.abs(zt)
+    )
+
+    """
+    gradients at top face of T cells
+    """
+    dTdz[:, :, :-1] = maskW[:, :, :-1] * \
+        (temp[:, :, 1:, tau] - temp[:, :, :-1, tau]) / \
+        dzw[np.newaxis, np.newaxis, :-1]
+    dSdz[:, :, :-1] = maskW[:, :, :-1] * \
+        (salt[:, :, 1:, tau] - salt[:, :, :-1, tau]) / \
+        dzw[np.newaxis, np.newaxis, :-1]
+
+    """
+    gradients at eastern face of T cells
+    """
+    dTdx[:-1, :, :] = maskU[:-1, :, :] * (temp[1:, :, :, tau] - temp[:-1, :, :, tau]) \
+        / (dxu[:-1, np.newaxis, np.newaxis] * cost[np.newaxis, :, np.newaxis])
+    dSdx[:-1, :, :] = maskU[:-1, :, :] * (salt[1:, :, :, tau] - salt[:-1, :, :, tau]) \
+        / (dxu[:-1, np.newaxis, np.newaxis] * cost[np.newaxis, :, np.newaxis])
+
+    """
+    gradients at northern face of T cells
+    """
+    dTdy[:, :-1, :] = maskV[:, :-1, :] * \
+        (temp[:, 1:, :, tau] - temp[:, :-1, :, tau]) \
+        / dyu[np.newaxis, :-1, np.newaxis]
+    dSdy[:, :-1, :] = maskV[:, :-1, :] * \
+        (salt[:, 1:, :, tau] - salt[:, :-1, :, tau]) \
+        / dyu[np.newaxis, :-1, np.newaxis]
+
+    # def dm_taper(sx):
+    #     """
+    #     tapering function for isopycnal slopes
+    #     """
+    #     return 0.5 * (1. + np.tanh((-np.abs(sx) + iso_slopec) / iso_dslope))
+
+    """
+    Compute Ai_ez and K11 on center of east face of T cell.
+    """
+    diffloc = np.zeros_like(K_11)
+    diffloc[1:-2, 2:-2, 1:] = 0.25 * (K_iso[1:-2, 2:-2, 1:] + K_iso[1:-2, 2:-2, :-1]
+                                      + K_iso[2:-1, 2:-2, 1:] + K_iso[2:-1, 2:-2, :-1])
+    diffloc[1:-2, 2:-2, 0] = 0.5 * \
+        (K_iso[1:-2, 2:-2, 0] + K_iso[2:-1, 2:-2, 0])
+
+    sumz = np.zeros_like(K_11)[1:-2, 2:-2]
+    for kr in range(2):
+        # ki = 0 if kr == 1 else 1
+        # ki = 1 - kr
+        for ip in range(2):
+            # drodxe = drdT[1 + ip:-2 + ip, 2:-2, ki:] * dTdx[1:-2, 2:-2, ki:] \
+            #     + drdS[1 + ip:-2 + ip, 2:-2, ki:] * dSdx[1:-2, 2:-2, ki:]
+            drodxe = drdT[1 + ip:drdT.shape[0]-2 + ip, 2:-2, 1-kr:] * dTdx[1:-2, 2:-2, 1-kr:] \
+                + drdS[1 + ip:drdS.shape[0]-2 + ip, 2:-2, 1-kr:] * dSdx[1:-2, 2:-2, 1-kr:]
+            # drodze = drdT[1 + ip:-2 + ip, 2:-2, ki:] * dTdz[1 + ip:-2 + ip, 2:-2, :-1 + kr or None] \
+            #     + drdS[1 + ip:-2 + ip, 2:-2, ki:] * \
+            #     dSdz[1 + ip:-2 + ip, 2:-2, :-1 + kr or None]
+            drodze = drdT[1 + ip:drdT.shape[0]-2 + ip, 2:-2, 1-kr:] * dTdz[1 + ip:dTdz.shape[0]-2 + ip, 2:-2, :dTdz.shape[-1]-1 + kr] \
+                + drdS[1 + ip:drdS.shape[0]-2 + ip, 2:-2, 1-kr:] * \
+                dSdz[1 + ip:dSdz.shape[0]-2 + ip, 2:-2, :dSdz.shape[-1]-1 + kr]
+            sxe = -drodxe / (np.minimum(0., drodze) - epsln)
+            # taper = dm_taper(sxe)
+            taper = 0.5 * (1. + np.tanh((-np.abs(sxe) + iso_slopec) / iso_dslope))
+            # sumz[:, :, ki:] += dzw[np.newaxis, np.newaxis, :-1 + kr or None] * maskU[1:-2, 2:-2, ki:] \
+            #     * np.maximum(K_iso_steep, diffloc[1:-2, 2:-2, ki:] * taper)
+            sumz[:, :, 1-kr:] += dzw[np.newaxis, np.newaxis, :S2-1 + kr] * maskU[1:-2, 2:-2, 1-kr:] \
+                * np.maximum(K_iso_steep, diffloc[1:-2, 2:-2, 1-kr:] * taper)
+            Ai_ez[1:-2, 2:-2, 1-kr:, ip, kr] = taper * \
+                sxe * maskU[1:-2, 2:-2, 1-kr:]
+    K_11[1:-2, 2:-2, :] = sumz / (4. * dzt[np.newaxis, np.newaxis, :])
+
+    """
+    Compute Ai_nz and K_22 on center of north face of T cell.
+    """
+    diffloc[...] = 0
+    diffloc[2:-2, 1:-2, 1:] = 0.25 * (K_iso[2:-2, 1:-2, 1:] + K_iso[2:-2, 1:-2, :-1]
+                                      + K_iso[2:-2, 2:-1, 1:] + K_iso[2:-2, 2:-1, :-1])
+    diffloc[2:-2, 1:-2, 0] = 0.5 * \
+        (K_iso[2:-2, 1:-2, 0] + K_iso[2:-2, 2:-1, 0])
+
+    # sumz = np.zeros_like(K_11)[2:-2, 1:-2]
+    sumz2 = np.zeros_like(K_11)[2:-2, 1:-2]
+    for kr in range(2):
+        # ki = 0 if kr == 1 else 1
+        # ki = 1 - kr
+        for jp in range(2):
+            # drodyn = drdT[2:-2, 1 + jp:-2 + jp, ki:] * dTdy[2:-2, 1:-2, ki:] + \
+            #     drdS[2:-2, 1 + jp:-2 + jp, ki:] * dSdy[2:-2, 1:-2, ki:]
+            drodyn = drdT[2:-2, 1 + jp:drdT.shape[1]-2 + jp, 1-kr:] * dTdy[2:-2, 1:-2, 1-kr:] + \
+                drdS[2:-2, 1 + jp:drdS.shape[1]-2 + jp, 1-kr:] * dSdy[2:-2, 1:-2, 1-kr:]
+            # drodzn = drdT[2:-2, 1 + jp:-2 + jp, ki:] * dTdz[2:-2, 1 + jp:-2 + jp, :-1 + kr or None] \
+            #     + drdS[2:-2, 1 + jp:-2 + jp, ki:] * \
+            #     dSdz[2:-2, 1 + jp:-2 + jp, :-1 + kr or None]
+            drodzn = drdT[2:-2, 1 + jp:drdT.shape[1]-2 + jp, 1-kr:] * dTdz[2:-2, 1 + jp:dTdz.shape[1]-2 + jp, :dTdz.shape[-1]-1 + kr] \
+                + drdS[2:-2, 1 + jp:drdS.shape[1]-2 + jp, 1-kr:] * \
+                dSdz[2:-2, 1 + jp:dSdz.shape[1]-2 + jp, :dSdz.shape[-1]-1 + kr]
+            syn = -drodyn / (np.minimum(0., drodzn) - epsln)
+            # taper = dm_taper(syn)
+            taper2 = 0.5 * (1. + np.tanh((-np.abs(syn) + iso_slopec) / iso_dslope))
+            # sumz[:, :, ki:] += dzw[np.newaxis, np.newaxis, :-1 + kr or None] \
+            #     * maskV[2:-2, 1:-2, ki:] * np.maximum(K_iso_steep, diffloc[2:-2, 1:-2, ki:] * taper)
+            # sumz2[:, :, ki:] += dzw[np.newaxis, np.newaxis, :-1 + kr] \
+            #     * maskV[2:-2, 1:-2, ki:] * np.maximum(K_iso_steep, diffloc[2:-2, 1:-2, ki:] * taper)
+            # Ai_nz[2:-2, 1:-2, ki:, jp, kr] = taper * \
+            #     syn * maskV[2:-2, 1:-2, ki:]
+            sumz2[:, :, 1-kr:] += dzw[np.newaxis, np.newaxis, :S2-1 + kr] \
+                * maskV[2:-2, 1:-2, 1-kr:] * np.maximum(K_iso_steep, diffloc[2:-2, 1:-2, 1-kr:] * taper2)
+            Ai_nz[2:-2, 1:-2, 1-kr:, jp, kr] = taper2 * \
+                syn * maskV[2:-2, 1:-2, 1-kr:]
+    K_22[2:-2, 1:-2, :] = sumz2 / (4. * dzt[np.newaxis, np.newaxis, :])
+
+    """
+    compute Ai_bx, Ai_by and K33 on top face of T cell.
+    """
+    sumx = np.zeros_like(K_11)[2:-2, 2:-2, :-1]
+    sumy = np.zeros_like(K_11)[2:-2, 2:-2, :-1]
+
+    for kr in range(2):
+        # drodzb = drdT[2:-2, 2:-2, kr:-1 + kr or None] * dTdz[2:-2, 2:-2, :-1] \
+        #     + drdS[2:-2, 2:-2, kr:-1 + kr or None] * dSdz[2:-2, 2:-2, :-1]
+        drodzb = drdT[2:-2, 2:-2, kr:drdT.shape[-1]-1 + kr] * dTdz[2:-2, 2:-2, :-1] \
+            + drdS[2:-2, 2:-2, kr:drdS.shape[-1]-1 + kr] * dSdz[2:-2, 2:-2, :-1]
+
+        # eastward slopes at the top of T cells
+        for ip in range(2):
+            # drodxb = drdT[2:-2, 2:-2, kr:-1 + kr or None] * dTdx[1 + ip:-3 + ip, 2:-2, kr:-1 + kr or None] \
+            #     + drdS[2:-2, 2:-2, kr:-1 + kr or None] * \
+            #     dSdx[1 + ip:-3 + ip, 2:-2, kr:-1 + kr or None]
+            drodxb = drdT[2:-2, 2:-2, kr:drdT.shape[-1]-1 + kr] * dTdx[1 + ip:dTdx.shape[0]-3 + ip, 2:-2, kr:dTdx.shape[-1]-1 + kr] \
+                + drdS[2:-2, 2:-2, kr:drdS.shape[-1]-1 + kr] * \
+                dSdx[1 + ip:dSdx.shape[0]-3 + ip, 2:-2, kr:dSdx.shape[-1]-1 + kr]
+            sxb = -drodxb / (np.minimum(0., drodzb) - epsln)
+            # taper = dm_taper(sxb)
+            taper3 = 0.5 * (1. + np.tanh((-np.abs(sxb) + iso_slopec) / iso_dslope))
+            sumx += dxu[1 + ip:S1-3 + ip, np.newaxis, np.newaxis] * \
+                K_iso[2:-2, 2:-2, :-1] * taper3 * \
+                sxb**2 * maskW[2:-2, 2:-2, :-1]
+            Ai_bx[2:-2, 2:-2, :-1, ip, kr] = taper3 * \
+                sxb * maskW[2:-2, 2:-2, :-1]
+
+        # northward slopes at the top of T cells
+        for jp in range(2):
+            # facty = cosu[1 + jp:-3 + jp] * dyu[1 + jp:-3 + jp]
+            facty = cosu[1 + jp:S1-3 + jp] * dyu[1 + jp:S1-3 + jp]
+            # drodyb = drdT[2:-2, 2:-2, kr:-1 + kr or None] * dTdy[2:-2, 1 + jp:-3 + jp, kr:-1 + kr or None] \
+            #     + drdS[2:-2, 2:-2, kr:-1 + kr or None] * \
+            #     dSdy[2:-2, 1 + jp:-3 + jp, kr:-1 + kr or None]
+            drodyb = drdT[2:-2, 2:-2, kr:drdT.shape[-1]-1 + kr] * dTdy[2:-2, 1 + jp:dTdy.shape[1]-3 + jp, kr:dTdy.shape[-1]-1 + kr] \
+                + drdS[2:-2, 2:-2, kr:drdS.shape[-1]-1 + kr] * \
+                dSdy[2:-2, 1 + jp:dSdy.shape[1]-3 + jp, kr:dSdy.shape[-1]-1 + kr]
+            syb = -drodyb / (np.minimum(0., drodzb) - epsln)
+            # taper = dm_taper(syb)
+            taper4 = 0.5 * (1. + np.tanh((-np.abs(syb) + iso_slopec) / iso_dslope))
+            sumy += facty[np.newaxis, :, np.newaxis] * K_iso[2:-2, 2:-2, :-1] \
+                * taper4 * syb**2 * maskW[2:-2, 2:-2, :-1]
+            Ai_by[2:-2, 2:-2, :-1, jp, kr] = taper4 * \
+                syb * maskW[2:-2, 2:-2, :-1]
+
+    K_33[2:-2, 2:-2, :-1] = sumx / (4 * dxt[2:-2, np.newaxis, np.newaxis]) + \
+        sumy / (4 * dyt[np.newaxis, 2:-2, np.newaxis]
+                * cost[np.newaxis, 2:-2, np.newaxis])
+    K_33[2:-2, 2:-2, -1] = 0.
+
+
+# Avoiding specialization of symbols ...
+cpu_sdfg = isoneutral_diffusion_pre.to_sdfg(strict=False)
+import copy
+gpu_sdfg = copy.deepcopy(cpu_sdfg)
+from dace.transformation.auto import auto_optimize as autoopt
+opt_cpu_sdfg = autoopt.auto_optimize(cpu_sdfg, dc.dtypes.DeviceType.CPU, symbols=None)
+# opt_gpu_sdfg = autoopt.auto_optimize(gpu_sdfg, dc.dtypes.DeviceType.GPU, symbols=None)
+# Make CPU sdfg single-threaded
+for node, _ in opt_cpu_sdfg.all_nodes_recursive():
+# for node, _ in cpu_sdfg.all_nodes_recursive():
+    if isinstance(node, dc.nodes.MapEntry):
+        node.map.schedule = dc.dtypes.ScheduleType.Sequential
+# # Move arrays to the device (GPU only)
+# for k, v in opt_gpu_sdfg.arrays.items():
+#     if not v.transient and type(v) == dc.data.Array:
+#         v.storage = dc.dtypes.StorageType.GPU_Global
+cpu_exec = opt_cpu_sdfg.compile()
+# cpu_exec = cpu_sdfg.compile()
+# try:
+#     gpu_exec = opt_gpu_sdfg.compile()
+# except:
+#     gpu_exec = None
+
+
+def prepare_inputs(*inputs, device):
+    if device == 'cpu':
+        return inputs
+    elif device == 'gpu':
+        import cupy as cp
+        out = [cp.asarray(k) for k in inputs]
+        cp.cuda.stream.get_current_stream().synchronize()
+        return out
+
+
+input_names = ['maskT', 'maskU', 'maskV', 'maskW',
+        'dxt', 'dxu', 'dyt', 'dyu', 'dzt', 'dzw',
+        'cost', 'cosu',
+        'salt', 'temp', 'zt',
+        'K_iso', 'K_11', 'K_22', 'K_33', 'Ai_ez', 'Ai_nz', 'Ai_bx', 'Ai_by']
+
+
+def run(*inputs, device='cpu'):
+    # isoneutral_diffusion_pre(*inputs)
+    input_dict = {k: v for k, v in zip(input_names, inputs)}
+    if device == 'cpu':
+        cpu_exec(**input_dict, S1=inputs[0].shape[0], S2=inputs[0].shape[-1])
+    # elif device == 'gpu':
+    #     gpu_exec(*inputs, S1=inputs[0].shape[0], S2=inputs[0].shape[-1])
+    return inputs[-7:]

@@ -189,6 +189,18 @@ def setup_tensorflow(device='cpu'):
     yield
 
 
+@setup_function
+def setup_dace(device='cpu'):
+    if device == 'cpu':
+        os.environ.update(
+            OMP_NUM_THREADS='1',
+        )
+    import dace
+    if device == 'gpu':
+        import cupy
+    yield
+
+
 __backends__ = {
     'numpy': setup_numpy,
     'bohrium': setup_bohrium,
@@ -197,5 +209,6 @@ __backends__ = {
     'theano': setup_theano,
     'numba': setup_numba,
     'pytorch': setup_pytorch,
-    'tensorflow': setup_tensorflow
+    'tensorflow': setup_tensorflow,
+    'dace': setup_dace
 }

@@ -108,3 +108,7 @@ venv.bak/
 
 # VSCode
 .vscode/
+
+# DaCe
+_dacegraphs/
+.dacecache/

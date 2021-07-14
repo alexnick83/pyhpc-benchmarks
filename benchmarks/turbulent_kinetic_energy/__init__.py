@@ -64,4 +64,5 @@ __implementations__ = (
     'numba',
     'numpy',
     'jax',
+    'dace'
 )
